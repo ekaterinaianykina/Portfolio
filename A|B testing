@@ -1,0 +1,48 @@
+!wget 'https://drive.google.com/uc?export=download&id=1MpWBFIbqu4mbiD0BBKYX6YhS-f4mN3Z_' -O data.zip
+
+!unzip data.zip
+
+import pandas as pd
+data = pd.read_csv('marketing_campaign.csv')
+data.dropna(axis = 0, inplace = True)
+
+data["conversion"]=data["converted"].astype('int')
+
+data = data[['user_id','date_served','variant','conversion']]
+data
+
+data['conversion'].value_counts()
+
+import numpy as np
+
+
+z_crit_value = 1.96 # соответствует доверительному интервалу в 95%
+k1 = data[data['variant']=='control']['conversion'].sum()
+n1 = data[data['variant']=='control'].shape[0]
+k2 = data[data['variant']=='personalization']['conversion'].sum()
+n2 = data[data['variant']=='personalization'].shape[0]
+
+k1, n1, k2, n2
+
+grouped = data.pivot_table(values='conversion', index='variant', aggfunc=['sum', 'count'])
+grouped
+
+p1, p2 = k1/n1, k2/n2
+p1, p2
+
+P = (p1*n1 + p2*n2) / (n1 + n2)
+z = (p1 - p2) / (P * (1 - P) * (1/n1 + 1/n2))**(1/2)
+z
+
+if abs(z) > z_crit_value:
+    print("We may reject the null hypothesis!")
+else:
+    print("We have failed to reject the null hypothesis")
+    
+import matplotlib.pyplot as plt
+
+plt.figure(figsize=(8, 6))
+plt.bar([1, 2], grouped['count']['conversion'], label='Всего клиентов')
+plt.bar([1, 2], grouped['sum']['conversion'], bottom=grouped['count']['conversion'], label='Покупки')
+plt.xticks([1, 2], ['control', 'personalization'])
+plt.legend();
