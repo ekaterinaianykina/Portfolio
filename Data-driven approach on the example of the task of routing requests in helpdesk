@@ -1,0 +1,139 @@
+!wget 'https://drive.google.com/uc?export=download&id=1g8lsZO25O2SxuCrIYVSDV3eLqmfC-TCZ' -O WA_Fn-UseC_-Telco-Customer-Churn.csv
+
+import pandas as pd
+import numpy as np
+
+df = pd.read_csv("./WA_Fn-UseC_-Telco-Customer-Churn.csv")
+df.head(3)
+
+df['gender'].value_counts()
+
+df['InternetService'].unique()
+
+df['TotalCharges'].describe()
+
+df["PhoneService"]=np.where(df["PhoneService"] == "Yes", 1, 0)
+df["PhoneService"]
+
+df["TotalCharges"]=np.where(df["TotalCharges"] == " ",np.nan,df["TotalCharges"])
+df["TotalCharges"]=df["TotalCharges"].astype('float32')
+df["TotalCharges"]=df["TotalCharges"].fillna(0)
+df['TotalCharges'].describe()
+
+df["Churn"]=np.where(df["Churn"] == "Yes", 1, 0)
+
+df['StreamingMovies']=np.where(df['StreamingMovies'] == "Yes", 1 or df['StreamingMovies']=="No internet service",0)
+df['StreamingTV']=np.where(df['StreamingTV'] == "Yes", 1 or df['StreamingTV']=="No internet service",0)
+df['TechSupport']=np.where(df['TechSupport'] == "Yes", 1 or df['TechSupport']=="No internet service",0)
+
+df['PhoneService'].isnull().value_counts()
+df['PhoneService']=df['PhoneService'].fillna(0)
+
+columns = ['gender', 'tenure', 'PhoneService', 'TotalCharges', 
+           'StreamingMovies', 'StreamingTV', 'TechSupport', 'Churn']
+df_new=df[columns]
+df_new.head(3)
+
+features = ['gender', 'tenure', 'PhoneService', 'TotalCharges', 'StreamingMovies', 'StreamingTV', 'TechSupport']
+target = 'Churn'
+
+from sklearn.model_selection import train_test_split
+X_train, X_test, y_train, y_test = train_test_split(df_new[features], df_new[target], test_size=0.33, random_state=42)
+
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.pipeline import Pipeline
+
+class ColumnSelector(BaseEstimator, TransformerMixin):
+    """
+    Transformer to select a single column from the data frame to perform additional transformations on
+    """
+    def __init__(self, key):
+        self.key = key
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        return X[self.key]
+    
+class NumberSelector(BaseEstimator, TransformerMixin):
+    """
+    Transformer to select a single column from the data frame to perform additional transformations on
+    Use on numeric columns in the data
+    """
+    def __init__(self, key):
+        self.key = key
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        return X[[self.key]]
+    
+class OHEEncoder(BaseEstimator, TransformerMixin):
+    def __init__(self, key):
+        self.key = key
+        self.columns = []
+
+    def fit(self, X, y=None):
+        self.columns = [col for col in pd.get_dummies(X, prefix=self.key).columns]
+        return self
+
+    def transform(self, X):
+        X = pd.get_dummies(X, prefix=self.key)
+        test_columns = [col for col in X.columns]
+        for col_ in test_columns:
+            if col_ not in self.columns:
+                X[col_] = 0
+        return X[self.columns]
+
+gender = Pipeline([
+                ('selector', ColumnSelector(key='gender')),
+                ('ohe', OHEEncoder(key='gender'))
+            ])
+            
+gender.fit_transform(X_train)
+
+from sklearn.preprocessing import StandardScaler
+
+tenure =  Pipeline([
+                ('selector', NumberSelector(key='tenure')),
+                ('standard', StandardScaler())
+            ])
+            
+TotalCharges =  Pipeline([
+                ('selector', NumberSelector(key='TotalCharges')),
+                ('standard', StandardScaler())
+            ])
+            
+from sklearn.pipeline import FeatureUnion
+
+number_features = Pipeline([
+                ('selector', ColumnSelector(key=['PhoneService',
+                                                 'StreamingMovies', 'StreamingTV', 
+                                                 'TechSupport']))
+            ])
+            
+feats = FeatureUnion([('tenure', tenure),
+                      ('TotalCharges', TotalCharges),
+                      ('continuos_features', number_features),
+                      ('gender', gender)])
+feature_processing = Pipeline([('feats', feats)])
+
+from sklearn.ensemble import RandomForestClassifier
+
+pipeline = Pipeline([
+    ('features', feats),
+    ('classifier', RandomForestClassifier(random_state=42)),
+])
+
+pipeline.fit(X_train, y_train)
+
+forecast=pipeline.predict(X_test)
+
+from sklearn.metrics import roc_auc_score
+roc_auc_score(y_test,forecast)
+
+import dill
+with open("model_RF.dill", "wb") as f:
+    dill.dump(pipeline, f)
