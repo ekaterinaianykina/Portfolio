@@ -1,0 +1,61 @@
+import pandas as pd
+import numpy as np
+data = pd.read_csv("adult.data", header=None)
+data.head(3)
+
+data[14] = data[14].map({' <=50K': 0, ' >50K': 1}) 
+data[14]
+
+from sklearn.model_selection import train_test_split
+
+x_data = pd.get_dummies(data.iloc[:,:-1])
+y_data = data.iloc[:,-1]
+
+x_train, x_test, y_train, y_test = train_test_split(x_data, y_data, test_size=0.2, random_state=7)
+
+import xgboost as xgb
+
+model = xgb.XGBClassifier()
+
+model.fit(x_train, y_train)
+y_predict = model.predict(x_test)
+
+from sklearn.metrics import recall_score, precision_score, roc_auc_score, accuracy_score, f1_score
+
+def evaluate_results(y_test, y_predict):    
+    f1 = f1_score(y_test, y_predict) * 100
+    roc = roc_auc_score(y_test, y_predict) * 100
+    rec = recall_score(y_test, y_predict, average='binary') * 100
+    prc = precision_score(y_test, y_predict, average='binary') * 100
+    return f1, roc, rec, prc
+    
+mod_data = pd.get_dummies(data.copy())
+pos_ind = np.where(mod_data.loc[:, 14].values == 1)[0]
+np.random.shuffle(pos_ind)
+pos_sample_len = int(np.ceil(0.25 * len(pos_ind)))
+print(f'Using {pos_sample_len}/{len(pos_ind)} as positives and unlabeling the rest')
+pos_sample = pos_ind[:pos_sample_len]
+
+mod_data['class_test'] = -1
+mod_data.loc[pos_sample,'class_test'] = 1
+print('target variable:\n', mod_data.iloc[:,-1].value_counts())
+
+x_data = mod_data.drop([14, 'class_test'], axis = 1)
+y_labeled = mod_data.loc[:,'class_test'].values
+y_positive = mod_data.loc[:,14].values
+
+mod_data = mod_data.sample(frac=1)
+neg_sample = mod_data[mod_data['class_test']==-1][:len(mod_data[mod_data['class_test']==1])]
+sample_test = mod_data[mod_data['class_test']==-1][len(mod_data[mod_data['class_test']==1]):]
+pos_sample = mod_data[mod_data['class_test']==1]
+print(neg_sample.shape, pos_sample.shape)
+sample_train = pd.concat([neg_sample, pos_sample]).sample(frac=1)
+
+model_rns = xgb.XGBClassifier()
+
+model_rns.fit(sample_train.drop([14, 'class_test'], axis=1).values,
+          sample_train.loc[:, 14].values)
+y_predict_rns = model_rns.predict(sample_test.drop([14, 'class_test'], axis=1).values)
+
+pd.DataFrame([evaluate_results(y_test, y_predict), evaluate_results(sample_test.loc[:, 14].values, y_predict_rns)
+             ], columns={'f1', 'precision', 'recall', 'roc'}, index={'xgboost', 'rns'}).round(3)
