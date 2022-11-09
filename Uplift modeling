@@ -1,0 +1,126 @@
+%matplotlib inline
+
+import pandas as pd; pd.set_option('display.max_columns', None)
+from sklearn.model_selection import train_test_split
+
+df_data = pd.read_csv('data.csv')
+df_data.head(3)
+
+df_data.rename(columns={'conversion': 'target', 'offer': 'treatment'}, inplace=True)
+
+df_data.loc[df_data['treatment'] == 'Buy One Get One', 'treatment'] = 1
+df_data.loc[df_data['treatment'] == 'Discount', 'treatment'] = 1
+df_data.loc[df_data['treatment'] == 'No Offer', 'treatment'] = 0
+df_data['treatment'] = df_data['treatment'].astype('int32')
+df_data['treatment']
+
+indices_learn, indices_valid = train_test_split(df_data, test_size=0.3, random_state=123)
+
+X_train = indices_learn.copy()
+X_train = X_train.drop(columns = ['target', 'treatment'])
+y_train = indices_learn['target'].copy()
+treat_train = indices_learn['treatment'].copy()
+
+X_val = indices_valid.copy()
+X_val = X_val.drop(columns = ['target', 'treatment'])
+y_val = indices_valid['target'].copy()
+treat_val = indices_valid['treatment'].copy()
+
+!pip install scikit-uplift catboost
+
+from sklift.metrics import uplift_at_k
+from sklift.viz import plot_uplift_preds
+from sklift.models import SoloModel
+from catboost import CatBoostClassifier
+
+cat_features = ['zip_code', 'channel']
+models_results = {
+    'approach': [],
+    'uplift@10%': [],
+    'uplift@20%': []
+    
+}
+
+sm = SoloModel(CatBoostClassifier(iterations=20, thread_count=2, random_state=42, silent=True))
+sm = sm.fit(X_train, y_train, treat_train, estimator_fit_params={'cat_features': cat_features})
+
+uplift_sm = sm.predict(X_val)
+
+sm_score_10 = uplift_at_k(y_true=y_val, uplift=uplift_sm, treatment=treat_val, strategy='by_group', k=0.1)
+sm_score_20 = uplift_at_k(y_true=y_val, uplift=uplift_sm, treatment=treat_val, strategy='by_group', k=0.2)
+
+models_results['approach'].append('SoloModel')
+models_results['uplift@10%'].append(sm_score_10)
+models_results['uplift@20%'].append(sm_score_20)
+
+sm_trmnt_preds = sm.trmnt_preds_
+sm_ctrl_preds = sm.ctrl_preds_
+
+plot_uplift_preds(trmnt_preds=sm_trmnt_preds, ctrl_preds=sm_ctrl_preds);
+
+sm_fi = pd.DataFrame({
+    'feature_name': sm.estimator.feature_names_,
+    'feature_score': sm.estimator.feature_importances_
+}).sort_values('feature_score', ascending=False).reset_index(drop=True)
+
+sm_fi
+
+sm_score_10
+
+sm_score_20
+
+from sklift.models import ClassTransformation
+
+
+ct = ClassTransformation(CatBoostClassifier(iterations=20, thread_count=2, random_state=42, silent=True))
+ct = ct.fit(X_train, y_train, treat_train, estimator_fit_params={'cat_features': cat_features})
+
+uplift_ct = ct.predict(X_val)
+
+ct_score_10 = uplift_at_k(y_true=y_val, uplift=uplift_ct, treatment=treat_val, strategy='by_group', k=0.1)
+ct_score_20 = uplift_at_k(y_true=y_val, uplift=uplift_ct, treatment=treat_val, strategy='by_group', k=0.2)
+
+
+models_results['approach'].append('ClassTransformation')
+models_results['uplift@10%'].append(ct_score_10)
+models_results['uplift@20%'].append(ct_score_20)
+
+ct_score_10
+
+ct_score_20
+
+from sklift.viz import plot_uplift_curve
+
+plot_uplift_curve(
+    y_val, uplift_ct, treat_val, 
+    perfect=False
+);
+
+from sklift.models import TwoModels
+
+
+tm = TwoModels(
+    estimator_trmnt=CatBoostClassifier(iterations=20, thread_count=2, random_state=42, silent=True), 
+    estimator_ctrl=CatBoostClassifier(iterations=20, thread_count=2, random_state=42, silent=True), 
+    method='vanilla'
+)
+tm = tm.fit(
+    X_train, y_train, treat_train,
+    estimator_trmnt_fit_params={'cat_features': cat_features}, 
+    estimator_ctrl_fit_params={'cat_features': cat_features}
+)
+
+uplift_tm = tm.predict(X_val)
+
+tm_score_10 = uplift_at_k(y_true=y_val, uplift=uplift_tm, treatment=treat_val, strategy='by_group', k=0.1)
+tm_score_20 = uplift_at_k(y_true=y_val, uplift=uplift_tm, treatment=treat_val, strategy='by_group', k=0.2)
+
+
+models_results['approach'].append('TwoModels')
+models_results['uplift@10%'].append(tm_score_10)
+models_results['uplift@20%'].append(tm_score_20)
+
+
+plot_uplift_preds(trmnt_preds=tm.trmnt_preds_, ctrl_preds=tm.ctrl_preds_)
+
+pd.DataFrame(data=models_results).sort_values('uplift@10%', ascending=False)
