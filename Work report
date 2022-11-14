@@ -1,0 +1,602 @@
+import os
+import pytz
+import numpy as np
+import pandas as pd
+import sqlalchemy as sa
+from ast import literal_eval
+import collections
+import json
+import re
+import string
+import datetime
+import pickle
+import statistics
+import datetime
+
+import seaborn as sn
+import matplotlib.pyplot as plt
+%matplotlib inline 
+
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+import warnings
+warnings.filterwarnings('ignore')
+
+pd.options.display.max_colwidth = 500
+pd.options.display.max_rows = 150
+pd.options.display.max_columns = 150
+
+dbconn = sa.create_engine('postgresql://login:password@host/database')
+dbconn_adapter = sa.create_engine('postgresql://login:password@host/database')
+dbconn_new = sa.create_engine('postgresql://login:password@host/database')
+db_clickhouse = sa.create_engine('clickhouse+native://login:password@host:port')
+
+date_start = f"""2022-01-01 00:00:00""" 
+date_end = f"""2022-05-31 00:00:00""" 
+
+query = f"""
+    SELECT DISTINCT id as event_id
+         , name as event_name
+         , created_at + interval '3 hours' as created_date
+         , begin_date
+         , tonality
+         , status
+         , author_id
+         , audience_count
+         , audience_count_max
+         , executive_authority
+         , creator_ea_id
+         , criticality
+         , duplicate_lead
+    FROM events
+    WHERE status in ('ACTIVE', 'PROCESSING', 'COMPLETED', 'ARCHIVED') 
+      AND deleted_at is NULL
+      AND created_at + interval '3 hours' > '{date_start}'
+      AND created_at + interval '3 hours' < '{date_end}' 
+"""
+df_events = pd.read_sql(query, con=dbconn)
+df_events['tonality'] = df_events['tonality'].fillna('NEUTRAL')
+print(df_events.shape)
+df_events.head(1)
+
+query = f"""
+    SELECT core_event_id as event_id
+         , max(auditory_index) as auditory_index 
+    FROM public.event_history 
+    WHERE created_at + interval '3 hours' > '{date_start}'
+      AND created_at + interval '3 hours' < '{date_end}' 
+      AND auditory_index > 0
+    GROUP BY core_event_id
+"""
+df_ai = pd.read_sql(query, dbconn_new)
+print(df_ai.shape)
+
+df_events = df_events.merge(df_ai, on='event_id', how='left', suffixes=['', '_err'])
+print(df_events.shape)
+df_events.head(1)
+
+query = f"""
+    SELECT DISTINCT event_id
+         , executive_authority_id 
+         , 1 as has_situation
+    FROM situations 
+    WHERE length(description)>=10 
+"""
+df_situations = pd.read_sql(query, con=dbconn)
+print(df_situations.shape)
+
+df_events = df_events.merge(df_situations[['event_id', 'has_situation']].drop_duplicates(), 
+                            on='event_id', how='left', suffixes=['', '_err'])
+print(df_events.shape)
+df_events.head(1)
+
+query = """
+    select distinct object_id, time, change_columns, diff, replace(diff,'"','') as diff_new
+    from logs.audit_log al 
+    where (   diff ilike '%%"status":"REJECT"%%'
+           or diff ilike '%%"status":"ACTIVE"%%'
+           or diff ilike '%%"status":"COMPLETED"%%'
+           or diff ilike '%%"status":"PROCESSING"%%'
+           or diff ilike '%%"status":"DELETED"%%'
+           or diff ilike '%%"status":"ARCHIVED"%%'
+           or diff ilike '%%"status":"PREMODERATION"%%')
+      and object_type='event' and time>='2020-01-01 00:00:00'
+"""
+
+df_logs = pd.read_sql(query, db_clickhouse)
+print(df_logs.shape)
+print(df_logs.columns)
+#print(df_logs)
+
+def take_status(x):
+    finds = re.findall('(?<="status":")[^"]*(?=")', x, re.IGNORECASE)
+    if (len(finds) == 1): return finds[0]
+    elif (len(finds) > 1): 
+        #print('!!!!', x, finds[-1])
+        return finds[-1]
+    else: return ''
+
+df_logs['diff'] = df_logs['diff'].apply(take_status)
+df_logs['rank'] = df_logs.groupby(['object_id'])['time'].rank(method="first", ascending=True)
+df_logs['max_rank'] = df_logs.groupby(['object_id'])['rank'].transform(max)
+
+events_deleted = df_logs[df_logs['rank'] == df_logs['max_rank']]\
+                        [df_logs['diff'] == 'DELETED']['object_id'].unique().tolist()
+    
+events_reject = df_logs[df_logs['rank'] == df_logs['max_rank']]\
+                       [df_logs['diff'] == 'REJECT']['object_id'].unique().tolist()
+print(df_logs.shape,
+      '\n\r Событий со статусом "DELETED": ', len(events_deleted), 
+      '\n\r Событий со статусом "REJECT": ', len(events_reject))
+df_logs.head(1)
+
+query = """
+    SELECT *
+    FROM event_files 
+    WHERE type ='situation'
+      and event_id = 1145550
+"""
+df_matetial = pd.read_sql(query, con=dbconn)
+print(df_matetial.shape)
+
+query = """
+    SELECT DISTINCT event_id
+         , 1 as has_mat
+    FROM tasks 
+    WHERE files[1] is not null OR expert is not null
+UNION
+    SELECT event_id 
+         , 1 as has_mat
+    FROM tasks 
+    WHERE type_content::varchar ilike '%%fileHashes": [%%]%%' 
+      AND type_content::varchar not ilike '%%"fileHashes": []%%'
+UNION
+    SELECT DISTINCT event_id 
+         , 1 as has_mat
+    FROM event_experts 
+    WHERE name is not null
+UNION
+    SELECT distinct event_id 
+         , 1 as has_mat
+    FROM event_files 
+    WHERE type ='situation'
+"""
+df_matetial = pd.read_sql(query, con=dbconn)
+print(df_matetial.shape)
+
+df_events = df_events.merge(df_matetial.drop_duplicates(), on='event_id', how='left', suffixes=['', '_err'])
+print(df_events.shape)
+df_events.head(1)
+
+query = f"""
+    SELECT event_id
+         , 1 as has_task
+         , min(created_at)::timestamp as task_time
+    FROM tasks 
+    GROUP BY event_id
+"""
+df_tasks = pd.read_sql(query, con=dbconn)
+print(df_tasks.shape)
+df_tasks.head(5)
+
+df_events = df_events.merge(df_tasks, on='event_id', how='left', suffixes=['', '_err'])
+print(df_events.shape)
+#df_events.head(1)
+
+query = f"""
+    SELECT DISTINCT parent_id as event_id 
+         , 1 as has_react
+    FROM event_relations 
+    WHERE type='WORKING'
+      AND parent_id in (SELECT id 
+                        FROM events e2 
+                        WHERE tonality='NEGATIVE')
+      AND child_id in (SELECT id 
+                       FROM events e2 
+                       WHERE tonality is null OR tonality<>'NEGATIVE')
+"""
+df_reations = pd.read_sql(query, con=dbconn)
+print(df_reations.shape)
+
+df_events = df_events.merge(df_reations, on='event_id', how='left', suffixes=['', '_err'])
+print(df_events.shape)
+df_events.head(1)
+
+query = f"""
+    SELECT object_id as event_id 
+         , min(case when diff like '%%executive_authority%%' then time end) oiv_time
+         , min(case when diff like '%%situation_id%%' then time end) sit_time 
+         , min(case when diff ilike '%%status":"ACTIVE%%' then time end) active_time
+    FROM logs.audit_log where object_type = 'event' 
+     AND (diff like '%%executive_authority%%' OR diff like '%%situation_id%%') 
+     AND object_type='event' 
+    GROUP BY object_id
+"""
+df_dates = pd.read_sql(query, con=db_clickhouse)
+print(df_dates.shape)
+
+df_events = df_events.merge(df_dates, on='event_id', how='left', suffixes=['', '_err'])
+print(df_events.shape)
+df_events.head(1)
+
+   SELECT id
+         , name
+         , avatar
+         , parent_id
+         , type
+         , replace(name_long,'"',' ') as name_long
+         , path 
+    FROM executive_authorities ea
+"""
+df_auth = pd.read_sql(query, con=dbconn)
+print(df_auth.shape)
+df_auth.head(1)
+
+print(len(df_events))
+df_events = df_events[~df_events['event_id'].isin(events_deleted)] 
+df_events = df_events[~df_events['event_id'].isin(events_reject)] 
+print(len(df_events))
+
+df_a1 = df_auth[df_auth['parent_id'].isnull()][['id', 'parent_id', 'name', 'type']]
+
+df_a2 = df_a1.merge(df_auth[['id', 'parent_id', 'name', 'type']],
+                    left_on='id',
+                    right_on='parent_id',
+                    how='inner',
+                    suffixes=['', '_1'])
+
+df_a3 = df_a2.merge(df_auth[['id', 'parent_id', 'name', 'type']],
+                    left_on='id_1',
+                    right_on='parent_id',
+                    how='left',
+                    suffixes=['', '_2'])
+print('----------------------------------------------------------------------------------------')
+df_ea = pd.concat([df_a1, df_a2, df_a3], ignore_index=True)
+df_ea = df_ea.drop_duplicates().reset_index().drop('index', axis=1)
+df_ea['id_merge'] = df_ea['id_2'].fillna(df_ea['id_1']).fillna(df_ea['id'])
+print(df_ea.shape)
+df_ea.head(1)
+
+df_ea_rel = pd.concat([
+    df_ea[['id_2', 'id_1']].rename(columns={'id_2':'key', 'id_1':'value'}),
+    df_ea[['id_2', 'id']].rename(columns={'id_2':'key', 'id':'value'}),
+    df_ea[['id_1', 'id']].rename(columns={'id_1':'key', 'id':'value'})
+], ignore_index=True)
+df_ea_rel = df_ea_rel[~df_ea_rel['key'].isnull() & 
+                      ~df_ea_rel['value'].isnull()].groupby('key').agg({'value':set}).reset_index()
+df_ea_rel['value'] = df_ea_rel['value'].apply(list)
+ea_rel = df_ea_rel.set_index('key')['value'].to_dict()
+
+def add_ea_rel(l_ea):
+    res = []
+    if l_ea!=None:
+        for ea in l_ea:
+        #print(l_ea)
+            if ea in ea_rel.keys():
+                res = res + ea_rel[ea]
+            res.append(ea)
+        res = list(set(res))
+        return res
+
+df_events['executive_authority'] = df_events['executive_authority'].apply(add_ea_rel)
+
+print('----------------------------------------------------------------------------------------')
+df_t1 = df_events[['event_id', 'executive_authority']].explode('executive_authority')
+df_t1 = df_t1.rename(columns={'executive_authority':'executive_authority_id'})
+df_t1 = df_t1[~df_t1['executive_authority_id'].isnull()]
+df_t1 = df_t1.drop_duplicates().reset_index().drop('index', axis=1)
+print(df_t1.shape)
+# print(df_t1.head(3))
+
+### dash_exec_summary
+print('----------------------------------------------------------------------------------------')
+df_exec = df_t1.merge(df_ea, left_on='executive_authority_id', right_on='id_merge', how='inner', suffixes=['', '_auth'])
+df_exec = df_exec.drop_duplicates().reset_index().drop('index', axis=1)
+print(df_exec.shape)
+df_exec.head(1)
+
+### 1
+df_situations['situation_ok_1'] = 1
+print('Нет дублей:', len(df_situations) == len(df_situations.drop_duplicates())) 
+
+df_exec = df_exec.merge(df_situations, 
+                        left_on=['event_id', 'executive_authority_id'], 
+                        right_on=['event_id', 'executive_authority_id'], 
+                        how='left', suffixes=['', '_sit'])
+print(df_exec['situation_ok_1'].value_counts())
+
+### 2
+df_situations_2 = df_exec[df_exec['situation_ok_1'] == 1][['event_id', 'id']].drop_duplicates()
+df_situations_2['situation_ok_2'] = 1
+
+df_exec = df_exec.merge(df_situations_2, 
+                        left_on=['event_id', 'id'], 
+                        right_on=['event_id', 'id'], 
+                        how='left', suffixes=['', '_sit_2'])
+df_exec['situation_ok'] = 1
+df_exec['situation_ok'] = df_exec[(df_exec['situation_ok_2'] == 1 & 
+                                   df_exec['id_1'].isnull() & 
+                                   df_exec['id_2'].isnull() & 
+                                   df_exec['situation_ok_1'].isnull()) | 
+                                  ~df_exec['situation_ok_1'].isnull()]['situation_ok'] * 1
+df_exec.drop(['situation_ok_1', 'situation_ok_2'], axis=1, inplace=True)
+print(df_exec['situation_ok'].value_counts())
+df_exec.head(1)
+
+df_summary = df_events.copy()
+
+df_summary['week_created'] = (df_summary['created_date'] - pd.Timedelta(hours=24)).dt.week
+df_summary['oiv_author'] = (df_summary['author_id'] == 1) * 1 + 0
+df_summary['prizma_author'] = (df_summary['author_id'] == 2) * 1 + 0
+df_summary['editor_author'] = (df_summary['author_id'] == 1) & (df_summary['creator_ea_id'] == 120) * 1 + 0
+
+df_summary['has_situation'] = (~df_summary['has_situation'].isnull()) * 1 + 0
+df_summary['has_task'] = (~df_summary['has_task'].isnull()) * 1 + 0
+
+df_summary = df_summary[['event_id', 'created_date', 'week_created', 'tonality', 'status', 'audience_count', 
+                         'oiv_author', 'prizma_author', 'editor_author',
+                         'has_situation', 'has_task', 'has_mat', 'has_react', 'task_time', 
+                         'criticality', 'duplicate_lead', 
+                         'active_time', 'oiv_time', 'sit_time']]
+df_summary.head(1)
+
+ACTIVE = df_logs[df_logs['diff'] == 'ACTIVE']['object_id'].unique()
+df_summary['was_active'] = df_summary['event_id'].isin(ACTIVE) * 1
+
+PROCESSING = df_logs[df_logs['diff'] == 'PROCESSING']['object_id'].unique()
+
+df_summary['has_mat'] = df_summary['event_id'].isin(PROCESSING) * (~df_summary['has_mat'].isnull()) * 1 + 0
+
+df_summary['was_processing'] = df_summary['event_id'].isin(PROCESSING) * \
+                               df_summary['status'].isin(['PROCESSING','COMPLETED','DELETED','ARCHIVED']) * 1
+
+COMPLETED = df_logs[df_logs['diff'] == 'COMPLETED']['object_id'].unique()
+df_summary['was_completed'] = df_summary['event_id'].isin(COMPLETED) * \
+                              df_summary['status'].isin(['COMPLETED','DELETED','ARCHIVED']) * 1
+
+df_summary['was_completed_after_processing'] = df_summary['event_id'].isin(COMPLETED) * \
+                                               df_summary['event_id'].isin(PROCESSING) * \
+                                               df_summary['status'].isin(['COMPLETED','DELETED','ARCHIVED']) * 1
+
+df_summary['was_completed_after_active'] = df_summary['event_id'].isin(COMPLETED) * \
+                                           ~df_summary['event_id'].isin(PROCESSING) * \
+                                           df_summary['event_id'].isin(ACTIVE) * \
+                                           df_summary['status'].isin(['COMPLETED','DELETED','ARCHIVED']) * 1
+                                           
+df_summary['sit_time'] = df_summary.apply(lambda r: r['sit_time'] if r['has_situation'] == 1 else np.nan, axis=1)
+df_summary['oiv_sit_minutes'] = df_summary.apply(lambda r: r['sit_time'] - r['oiv_time'] 
+                                                           if (r['oiv_time'] == r['oiv_time']) and 
+                                                              (r['sit_time'] == r['sit_time']) and 
+                                                              (r['sit_time'] > r['oiv_time']) 
+                                                           else np.nan, axis=1)
+
+
+df_summary['oiv_sit_minutes'] = df_summary.apply(lambda r: r['sit_time'] - r['active_time'] 
+                                                           if (r['oiv_time'] == r['oiv_time']) and 
+                                                              (r['sit_time'] == r['sit_time']) and 
+                                                              (r['active_time'] == r['active_time']) and
+                                                              (r['sit_time'] <= r['oiv_time']) 
+                                                           else r['oiv_sit_minutes'], axis=1)
+
+df_summary['oiv_sit_minutes'] = df_summary['oiv_sit_minutes'].dt.total_seconds() 
+# df_summary['oiv_sit_minutes'] = round(df_summary['oiv_sit_minutes'].dt.total_seconds() / 60, 0)
+
+
+df_summary['sit_task_minutes'] = df_summary.apply(lambda r: r['task_time'] - r['sit_time'] 
+                                                            if (r['task_time'] == r['task_time']) and
+                                                               (r['sit_time'] == r['sit_time'])
+                                                            else np.nan, axis=1)
+
+df_summary['sit_task_minutes'] = df_summary['sit_task_minutes'].dt.total_seconds()
+
+for was_status in ['was_active', 'was_processing']:
+    df_summary[was_status + '_ohvat'] = df_summary.apply(lambda r: r['audience_count'] 
+                                                                   if r[was_status] == 1 else np.nan, axis=1)
+    
+df_summary['has_situation_ohvat'] = df_summary.apply(lambda r: r['audience_count'] 
+                                                               if r['has_situation'] == 1 else np.nan, axis=1)
+
+df_summary['has_task_wo_mat_cnt'] = df_summary.apply(lambda r: 1 
+                                                               if r['has_task'] == 1 and r['has_mat'] == 0 
+                                                               else 0, axis=1)
+df_summary['has_task_wo_mat_ohvat'] = df_summary.apply(lambda r: r['audience_count'] 
+                                                               if r['has_task'] == 1 and r['has_mat'] == 0 
+                                                               else np.nan, axis=1)
+for i in [1, 2, 3, 4]:
+    df_summary['crit_'+ str(i) + '_cnt'] = (df_summary['criticality'] == i) * 1 
+    
+for tnl in ['POSITIVE', 'NEUTRAL', 'NEGATIVE']:
+    df_summary[tnl.lower() + '_cnt'] = (df_summary['tonality'] == tnl) * 1 
+    df_summary[tnl.lower() + '_ohvat'] = df_summary.apply(lambda r: r['audience_count'] 
+                                                                    if r['tonality'] == tnl else np.nan, axis=1)
+    
+    df_summary[tnl.lower() + '_sit_cnt'] = ((df_summary['tonality'] == tnl) & (df_summary['has_situation'] == 1)) * 1 
+    df_summary[tnl.lower() + '_sit_ohvat'] = df_summary.apply(lambda r: r['audience_count'] 
+                                                                        if r['tonality'] == tnl and r['has_situation'] == 1
+                                                                        else np.nan, axis=1)
+    
+    df_summary[tnl.lower() + '_task_cnt'] = ((df_summary['tonality'] == tnl) & (df_summary['has_task'] == 1)) * 1 
+    df_summary[tnl.lower() + '_task_ohvat'] = df_summary.apply(lambda r: r['audience_count'] 
+                                                                         if r['tonality'] == tnl and r['has_task'] == 1
+                                                                         else np.nan, axis=1)
+    
+    df_summary[tnl.lower() + '_mat_cnt'] = ((df_summary['tonality'] == tnl) & (df_summary['has_mat'] == 1)) * 1 
+    
+    df_summary[tnl.lower() + '_react_cnt'] = ((df_summary['tonality'] == tnl) & (~df_summary['has_react'].isnull())) * 1 
+    df_summary[tnl.lower() + '_react_ohvat'] = df_summary.apply(lambda r: r['audience_count'] 
+                                                                if r['tonality'] == tnl and r['has_react'] == r['has_react']
+                                                                else np.nan, axis=1)
+                                                                
+dict_agg = {
+    'event_id':'nunique', 'audience_count':'sum', 
+    'oiv_author':'sum', 'prizma_author':'sum', 'editor_author':'sum',
+    'was_active':'sum', 'was_active_ohvat':'sum',
+    'was_processing':'sum','was_processing_ohvat':'sum',
+    'was_completed':'sum', 'was_completed_after_active':'sum', 'was_completed_after_processing':'sum',
+    'has_situation':'sum', 'has_situation_ohvat':'sum', 'situation_ok':'sum',
+    'has_task_wo_mat_cnt':'sum', 'has_task_wo_mat_ohvat':'sum',
+    'has_mat':'sum',
+    'crit_1_cnt':'sum','crit_2_cnt':'sum','crit_3_cnt':'sum','crit_4_cnt':'sum',
+
+    'positive_cnt':'sum', 'positive_ohvat':'sum',
+    'positive_sit_cnt':'sum', 'positive_sit_ohvat':'sum',
+    'positive_task_cnt':'sum', 'positive_task_ohvat':'sum',
+    'positive_mat_cnt':'sum',
+    'positive_react_cnt':'sum', 'positive_react_ohvat':'sum',
+
+    'neutral_cnt':'sum', 'neutral_ohvat':'sum',
+    'neutral_sit_cnt':'sum', 'neutral_sit_ohvat':'sum',
+    'neutral_task_cnt':'sum', 'neutral_task_ohvat':'sum',
+    'neutral_mat_cnt':'sum',
+    'neutral_react_cnt':'sum', 'neutral_react_ohvat':'sum',
+
+    'negative_cnt':'sum', 'negative_ohvat':'sum',
+    'negative_sit_cnt':'sum', 'negative_sit_ohvat':'sum',
+    'negative_task_cnt':'sum', 'negative_task_ohvat':'sum',
+    'negative_mat_cnt':'sum',
+    'negative_react_cnt':'sum', 'negative_react_ohvat':'sum',
+    
+    'oiv_sit_minutes':'median', 'sit_task_minutes':'median', 'oiv_sit_minutes_sovpad':'median',
+    'dop_situation_ok':'nunique'
+}
+
+dict_rename = { 
+    'id':'id_cnt',
+    'audience_count':'ohvat',
+    'oiv_author':'manual_aut_cnt',
+    'prizma_author':'prizma_aut_cnt',
+    'editor_author':'editor_aut_cnt',
+    'was_active':'was_active_cnt',
+    'was_processing':'was_processing_cnt',
+    'was_completed':'was_completed_cnt',
+    'was_completed_after_active':'was_completed_after_active_cnt',
+    'was_completed_after_processing':'was_completed_after_processing_cnt',
+    'has_situation':'has_situation_cnt',
+    'situation_ok':'situation_sovpad_cnt',
+    'has_mat':'has_mat_cnt',
+    'oiv_sit_minutes':'median_sit_oiv', 
+    'sit_task_minutes':'median_task_sit', 
+    'oiv_sit_minutes_sovpad':'median_sit_oiv_sovpad'
+}
+
+df_summary_crnt = df_summary.copy()
+print(df_summary_crnt.shape)
+
+df_summary_crnt['dop_situation_ok'] = df_summary_crnt['event_id'].isin(
+                                        df_exec[~df_exec['event_id'].isnull() & 
+                                                df_exec['situation_ok'] == 1]['event_id'].unique()) * 1
+
+df_summary_crnt['oiv_sit_minutes_sovpad'] = df_summary_crnt.apply(lambda r: r['oiv_sit_minutes'] 
+                                                                  if r['dop_situation_ok'] == 1 else np.nan, axis=1)
+df_summary_crnt['dop_situation_ok'] = df_summary_crnt.apply(lambda r: r['event_id'] 
+                                                            if r['dop_situation_ok'] == 1 else np.nan, axis=1)
+df_summary_crnt.head(1)
+
+df_X1 = df_summary_crnt.copy()
+df_X1['name'] = '  Всего'
+df_X1['name_1'] = ''
+df_X1['name_2'] = ''
+df_X1['situation_ok'] = df_X1['has_situation']
+print(len(df_X1))
+
+df_X1 = df_X1.groupby(['name', 'name_1', 'name_2']).agg(dict_agg, axis=1).reset_index().rename(columns = dict_rename)
+df_X1['situation_sovpad_cnt'] = df_X1['dop_situation_ok']
+df_X1
+
+df_X2 = df_summary_crnt[(~df_summary['event_id'].isin(df_exec['event_id'].unique()))].copy()
+df_X2['name'] = ' Без комплекса'
+df_X2['name_1'] = ''
+df_X2['name_2'] = ''
+df_X2['situation_ok'] = np.nan
+print(len(df_X2))
+
+df_X2 = df_X2.groupby(['name', 'name_1', 'name_2']).agg(dict_agg, axis=1).reset_index().rename(columns = dict_rename)
+df_X2['situation_sovpad_cnt'] = np.nan
+df_X2
+
+df_X3 = df_summary_crnt.copy()
+
+df_X3 = df_X3.merge(df_exec[df_exec['name_1'].isnull() & df_exec['name_2'].isnull()],
+                    left_on=['event_id'], 
+                    right_on=['event_id'], 
+                    how='inner', suffixes=['', '_exec'])
+df_X3['name_1'] = ''
+df_X3['name_2'] = ''
+print(len(df_X3))
+
+df_X3 = df_X3.groupby(['name', 'name_1', 'name_2']).agg(dict_agg, axis=1).reset_index().rename(columns = dict_rename)
+df_X3['name'] = df_X3['name'] + ' (Всего)'
+df_X3['situation_sovpad_cnt'] = df_X3['dop_situation_ok']
+df_X3
+
+df_X4 = df_summary_crnt.copy()
+
+df_X4 = df_X4.merge(df_exec[df_exec['name_1'].isnull() & df_exec['name_2'].isnull()],
+                    left_on=['event_id'], 
+                    right_on=['event_id'], 
+                    how='inner', suffixes=['', '_exec'])
+df_X4['name_1'] = ''
+df_X4['name_2'] = ''
+print(len(df_X4))
+
+df_exec_4 = df_exec[~df_exec['id_1'].isnull() | ~df_exec['id_2'].isnull()].copy()
+df_exec_4['indx'] = df_exec_4['event_id'].astype(str) + '_' + df_exec_4['id'].astype(str)
+
+df_X4['indx'] = df_X4['event_id'].astype(str) + '_' + df_X4['id'].astype(str)
+df_X4 = df_X4[~df_X4['indx'].isin(df_exec_4['indx'].unique())]
+
+df_X4 = df_X4.groupby(['name', 'name_1', 'name_2']).agg(dict_agg, axis=1).reset_index().rename(columns = dict_rename)
+df_X4['name_1'] = df_X4['name_1'] + '  (Только комплекс)'
+df_X4
+
+df_X5 = df_summary_crnt.copy()
+
+df_X5 = df_X5.merge(df_exec[~df_exec['name_1'].isnull() & df_exec['name_2'].isnull()],
+                    left_on=['event_id'], 
+                    right_on=['event_id'], 
+                    how='inner', suffixes=['', '_exec'])
+df_X5['name_2'] = ''
+print(len(df_X5))
+
+df_X5 = df_X5.groupby(['name', 'name_1', 'name_2']).agg(dict_agg, axis=1).reset_index().rename(columns = dict_rename)
+df_X5
+
+df_X6 = df_summary_crnt.copy()
+
+df_X6 = df_X6.merge(df_exec[~df_exec['name_1'].isnull() & ~df_exec['name_2'].isnull()],
+                    left_on=['event_id'], 
+                    right_on=['event_id'], 
+                    how='inner', suffixes=['', '_exec'])
+print(len(df_X6))
+
+df_X6 = df_X6.groupby(['name', 'name_1', 'name_2']).agg(dict_agg, axis=1).reset_index().rename(columns = dict_rename)
+df_X6
+
+df_itog = pd.concat([df_X1, df_X2, df_X3, df_X4, df_X5, df_X6], ignore_index=True)
+df_itog = df_itog.reset_index().drop('index', axis=1).sort_values(['name', 'name_1', 'name_2'])
+df_itog.head(1)
+
+df_excel = df_itog[[
+    'name', 'name_1', 'name_2',
+    'event_id', 'ohvat', 'manual_aut_cnt', 'prizma_aut_cnt', 'editor_aut_cnt',
+    'was_active_cnt', 'was_active_ohvat', 'was_processing_cnt', 'was_processing_ohvat',
+    'was_completed_cnt', 'was_completed_after_active_cnt', 'was_completed_after_processing_cnt',
+    'has_situation_cnt', 'has_situation_ohvat', 'situation_sovpad_cnt',
+    'has_task_wo_mat_cnt', 'has_task_wo_mat_ohvat', 'has_mat_cnt',
+    'median_sit_oiv', 'median_sit_oiv_sovpad', 'median_task_sit',
+    'crit_1_cnt', 'crit_2_cnt', 'crit_3_cnt', 'crit_4_cnt',
+    'positive_cnt', 'positive_ohvat',
+    'neutral_cnt', 'neutral_ohvat', 'negative_cnt', 'negative_ohvat',
+    'positive_sit_cnt', 'positive_sit_ohvat', 'positive_task_cnt', 'positive_task_ohvat',
+    'positive_mat_cnt', 'positive_react_cnt', 'positive_react_ohvat',
+    'neutral_sit_cnt', 'neutral_sit_ohvat', 'neutral_task_cnt', 'neutral_task_ohvat',
+    'neutral_mat_cnt', 'neutral_react_cnt', 'neutral_react_ohvat',
+    'negative_sit_cnt', 'negative_sit_ohvat', 'negative_task_cnt', 'negative_task_ohvat', 
+    'negative_mat_cnt', 'negative_react_cnt', 'negative_react_ohvat']].copy()
+    
+for clm in ['median_sit_oiv', 'median_sit_oiv_sovpad', 'median_task_sit']:
+    df_excel[clm] = df_excel[clm].fillna(0).apply(lambda x: round(x, 0))
+    df_excel[clm] = df_excel[clm].fillna(0).apply(lambda x: str(datetime.timedelta(seconds=x)) )
+    
+df_excel.to_excel(f"""Отчет_1_января_31_мая_2022.xlsx""", index=False)
